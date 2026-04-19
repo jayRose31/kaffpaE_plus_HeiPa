@@ -1,0 +1,3 @@
+[submodule "extern/gpu_heipa"]
+	path = extern/gpu_heipa
+	url = https://github.com/HenningWoydt/GPU-HeiPa.git

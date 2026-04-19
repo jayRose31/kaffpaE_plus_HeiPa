@@ -104,7 +104,7 @@ int main(int argn, char **argv) {
         t.restart();
 
         parallel_mh_async mh;
-        mh.perform_partitioning(partition_config, G);
+        mh.perform_partitioning(partition_config, G, graph_filename);
 
         
         int rank, size;

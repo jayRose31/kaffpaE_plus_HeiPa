@@ -21,6 +21,13 @@
 #include "quality_metrics.h"
 #include "random_functions.h"
 
+#include "extern/gpu_heipa/src/datastructures/memeticSolverShrinking.h"
+#include "extern/gpu_heipa/src/utility/memetic_configuration.h"
+#include <Kokkos_Core.hpp>
+
+
+
+
 parallel_mh_async::parallel_mh_async() : MASTER(0), m_time_limit(0) {
         m_best_global_objective = std::numeric_limits<EdgeWeight>::max();
         m_best_cycle_objective  = std::numeric_limits<EdgeWeight>::max();
@@ -29,6 +36,9 @@ parallel_mh_async::parallel_mh_async() : MASTER(0), m_time_limit(0) {
         m_communicator          = MPI_COMM_WORLD;
         MPI_Comm_rank( m_communicator, &m_rank);
         MPI_Comm_size( m_communicator, &m_size);
+
+        if( m_rank == (m_size - 1))
+                Kokkos::initialize();
 }
 
 parallel_mh_async::parallel_mh_async(MPI_Comm communicator) : MASTER(0), m_time_limit(0) {
@@ -40,13 +50,19 @@ parallel_mh_async::parallel_mh_async(MPI_Comm communicator) : MASTER(0), m_time_
         MPI_Comm_rank( m_communicator, &m_rank);
         MPI_Comm_size( m_communicator, &m_size);
 
+        if( m_rank == (m_size - 1))
+                Kokkos::initialize();
+
 }
 
 parallel_mh_async::~parallel_mh_async() {
+        if( m_rank == (m_size - 1))
+                Kokkos::finalize();
+        
         delete[] m_best_global_map;
 }
 
-void parallel_mh_async::perform_partitioning(const PartitionConfig & partition_config, graph_access & G) {
+void parallel_mh_async::perform_partitioning(const PartitionConfig & partition_config, graph_access & G, std::string graph_filename) {
         m_time_limit      = partition_config.time_limit;
         m_island          = new population(m_communicator, partition_config);
         m_best_global_map = new PartitionID[G.number_of_nodes()];
@@ -55,7 +71,9 @@ void parallel_mh_async::perform_partitioning(const PartitionConfig & partition_c
         random_functions::setSeed(partition_config.seed*m_size+m_rank);
 
         PartitionConfig ini_working_config  = partition_config; 
-        initialize( ini_working_config, G);
+
+        //! change this for GPU
+       initialize( ini_working_config, G);
 
         m_t.restart();
         exchanger ex(m_communicator);
@@ -71,7 +89,17 @@ void parallel_mh_async::perform_partitioning(const PartitionConfig & partition_c
                         ex.quick_start( working_config, G, *m_island );
                 }
 
-                perform_local_partitioning( working_config, G );
+                //! ADD partitioning call for GPU thread
+                //! make API-magic such that GPU solver works with the island stuff
+
+                std::cout << " perform local partitioning: " << std::endl;
+
+                if( m_rank == (m_size - 1)) {
+                      perform_local_partitioning_GPU( working_config, G, graph_filename);
+                }else{
+                      perform_local_partitioning( working_config, G );
+                }
+
                 if(m_rank == ROOT) {
                         std::cout <<  "t left " <<  (m_time_limit - m_t.elapsed()) << std::endl;
                 }
@@ -143,7 +171,7 @@ void parallel_mh_async::initialize(PartitionConfig & working_config, graph_acces
                 MPI_Recv(&population_size, 1, MPI_INT, ROOT, POPSIZE_TAG, m_communicator, &rst); 
         }
 
-        MPI_Barrier(MPI_COMM_WORLD);
+        MPI_Barrier(m_communicator);
 
         population_size = std::max(3, population_size);
         if(working_config.mh_easy_construction) {
@@ -217,6 +245,91 @@ EdgeWeight parallel_mh_async::collect_best_partitioning(graph_access & G, const 
         return best_global_objective;
 }
 
+
+EdgeWeight parallel_mh_async::perform_local_partitioning_GPU(PartitionConfig & working_config, graph_access & G, std::string graph_filename) {
+
+
+        quality_metrics qm;
+        unsigned local_repetitions = working_config.local_partitioning_repetitions;
+
+        if( working_config.mh_diversify ) {
+                diversifyer div;
+                div.diversify(working_config);
+        }
+
+        //start a new round
+        for( unsigned i = 0; i < local_repetitions; i++) {
+                Individuum newguy;
+
+                //TODO: create individual with GPU solver
+
+                GPU_HeiPa::MemeticConfiguration config = GPU_HeiPa::MemeticConfiguration();
+                config.graph_in = graph_filename;
+                config.k = working_config.k;
+                config.imbalance = working_config.imbalance / 100.0 ;
+                GPU_HeiPa::HostGraph host_g = GPU_HeiPa::from_file(config.graph_in);
+                GPU_HeiPa::HostPartition host_partition = GPU_HeiPa::memeticSolverShrinking(config).solve(host_g);
+                Kokkos::fence();
+
+                if(host_partition.extent(0) != (size_t)G.number_of_nodes()) {
+                        std::cout << "wrong dimension of host partition ..." << std::endl;
+                        // Fall back to a CPU-built individual if the GPU output shape is unexpected.
+                        m_island->createIndividuum(working_config, G, newguy, true);
+                } else {
+                        bool valid_partition_ids = true;
+                        forall_nodes(G, node) {
+                                if(static_cast<PartitionID>(host_partition(node)) >= G.get_partition_count()) {
+                                        valid_partition_ids = false;
+                                        std::cout << "wrong id somehow..." << std::endl;
+                                        break;
+                                }
+                        } endfor
+
+                        if(!valid_partition_ids) {
+                                // GPU solver may return sentinel IDs for failed/unassigned vertices.
+                                // Keep the MH population valid by falling back to CPU individual generation.
+                                m_island->createIndividuum(working_config, G, newguy, true);
+                        } else {
+                                
+                        int* partition_map = new int[G.number_of_nodes()];
+
+                        forall_nodes(G, node) {
+                                partition_map[node] = static_cast<int>(host_partition(node));
+                        } endfor
+
+                        newguy.partition_map = partition_map;
+                        newguy.objective     = qm.objective(working_config, G, partition_map);
+                        newguy.cut_edges     = new std::vector<EdgeID>();
+
+                        forall_nodes(G, node) {
+                                forall_out_edges(G, e, node) {
+                                        NodeID target = G.getEdgeTarget(e);
+                                        if(partition_map[node] != partition_map[target]) {
+                                                newguy.cut_edges->push_back(e);
+                                        }
+                                } endfor
+                        } endfor
+                        }
+                }
+                
+
+                //! for now just think of inserting / replacing
+                //! later i could add more V-cycle stuff if i want to...
+                if( working_config.mh_no_mh || !m_island->is_full() ) {
+                        m_island->insert(G, newguy);
+                }else{
+                        //! replace someone
+                }
+        }
+
+        
+        EdgeWeight min_objective = 0;
+        m_island->apply_fittest(G, min_objective);
+
+        return min_objective;
+}
+
+
 EdgeWeight parallel_mh_async::perform_local_partitioning(PartitionConfig & working_config, graph_access & G) {
 
         quality_metrics qm;
@@ -235,6 +348,9 @@ EdgeWeight parallel_mh_async::perform_local_partitioning(PartitionConfig & worki
                         if( !working_config.mh_easy_construction) {
                                 m_island->createIndividuum(working_config, G, first_ind, true);
                                 m_island->insert(G, first_ind);
+
+                                //! i dont even really have to understand island!
+                                //! i only need to create Individuum-objects using my solver, then i am fine :)
                         } else {
                                 construct_partition cp;
                                 cp.createIndividuum( working_config, G, first_ind, true); 
