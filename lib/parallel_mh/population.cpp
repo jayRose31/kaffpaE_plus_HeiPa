@@ -144,7 +144,8 @@ void population::insert(graph_access & G, Individuum & ind) {
                 for( unsigned i = 0; i < m_internal_population.size(); i++) {
                         if(m_internal_population[i].objective >= ind.objective) {
                                 //now measure
-				int diff_size = m_internal_population[i].cut_edges->size() + ind.cut_edges->size();
+
+				size_t diff_size = m_internal_population[i].cut_edges->size() + ind.cut_edges->size();
                                 std::vector<EdgeID> output_diff(diff_size,std::numeric_limits<EdgeID>::max());
 
                                 set_symmetric_difference(m_internal_population[i].cut_edges->begin(),
@@ -379,6 +380,10 @@ void population::get_two_individuals_tournament(Individuum & first, Individuum &
 void population::get_random_individuum(Individuum & ind) {
         int idx = random_functions::nextInt(0, m_internal_population.size()-1);
         ind     = m_internal_population[idx];
+}
+
+void population::get_individuum_at_pos(Individuum & ind, int pos) {
+        ind = m_internal_population.at(pos);
 }
 
 void population::get_best_individuum(Individuum & ind) {

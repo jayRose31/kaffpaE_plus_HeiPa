@@ -7,10 +7,12 @@
 
 #include <algorithm>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <mpi.h>
 #include <sstream>
 #include <stdio.h>
+#include <thread>
 
 #include "diversifyer.h"
 #include "exchange/exchanger.h"
@@ -25,12 +27,26 @@
 #include "extern/gpu_heipa/src/utility/memetic_configuration.h"
 #include <Kokkos_Core.hpp>
 
+namespace {
+Individuum clone_individuum(const Individuum & src, NodeID num_nodes) {
+        Individuum dst;
+        dst.objective = src.objective;
+
+        dst.partition_map = new int[num_nodes];
+        std::copy(src.partition_map, src.partition_map + num_nodes, dst.partition_map);
+
+        dst.cut_edges = new std::vector<EdgeID>(*src.cut_edges);
+        return dst;
+}
+} // namespace
+
 
 
 
 parallel_mh_async::parallel_mh_async() : MASTER(0), m_time_limit(0) {
         m_best_global_objective = std::numeric_limits<EdgeWeight>::max();
         m_best_cycle_objective  = std::numeric_limits<EdgeWeight>::max();
+        m_best_global_map       = NULL;
         m_rounds                = 0;
         m_termination           = false;
         m_communicator          = MPI_COMM_WORLD;
@@ -44,6 +60,7 @@ parallel_mh_async::parallel_mh_async() : MASTER(0), m_time_limit(0) {
 parallel_mh_async::parallel_mh_async(MPI_Comm communicator) : MASTER(0), m_time_limit(0) {
         m_best_global_objective = std::numeric_limits<EdgeWeight>::max();
         m_best_cycle_objective  = std::numeric_limits<EdgeWeight>::max();
+        m_best_global_map       = NULL;
         m_rounds                = 0;
         m_termination           = false;
         m_communicator          = communicator;
@@ -60,6 +77,14 @@ parallel_mh_async::~parallel_mh_async() {
                 Kokkos::finalize();
         
         delete[] m_best_global_map;
+}
+
+
+void idle_wait() {
+        std::cout << "start waiting" << std::endl;
+        sleep(10);
+        std::cout << "finish waiting" << std::endl;
+        return;
 }
 
 void parallel_mh_async::perform_partitioning(const PartitionConfig & partition_config, graph_access & G, std::string graph_filename) {
@@ -95,7 +120,106 @@ void parallel_mh_async::perform_partitioning(const PartitionConfig & partition_c
                 std::cout << " perform local partitioning: " << std::endl;
 
                 if( m_rank == (m_size - 1)) {
-                      perform_local_partitioning_GPU( working_config, G, graph_filename);
+
+                        /*
+                        
+                      perform_local_partitioning_GPU(
+                        working_config,
+                        G,
+                        graph_filename
+                      );
+
+                      */
+                      
+
+                        
+                        population* tmp_island_cpu = new population(m_communicator, partition_config);
+                        population* tmp_island_gpu = new population(m_communicator, partition_config);
+                        graph_access G_cpu;
+                        graph_access G_gpu;
+
+                        G.copy(G_cpu);
+                        G.copy(G_gpu);
+                        G_cpu.set_partition_count(G.get_partition_count());
+                        G_gpu.set_partition_count(G.get_partition_count());
+
+                        for( int i = 0; i < m_island->size(); ++i) {
+                                Individuum ind;
+                                m_island->get_individuum_at_pos(ind, i);
+
+                                Individuum cpu_clone = clone_individuum(ind, G.number_of_nodes());
+                                Individuum gpu_clone = clone_individuum(ind, G.number_of_nodes());
+
+                                tmp_island_cpu->insert(G_cpu, cpu_clone);
+                                tmp_island_gpu->insert(G_gpu, gpu_clone);
+                        }
+
+                      
+                      std::thread t1(
+                          &parallel_mh_async::perform_local_partitioning_GPU,
+                          this,
+                          std::ref(working_config),
+                                                  std::ref(G_gpu),
+                          graph_filename,
+                          tmp_island_gpu
+                      );  
+                      
+                      std::thread t2(
+                          static_cast<EdgeWeight (parallel_mh_async::*)(PartitionConfig &, graph_access &, population*)>(&parallel_mh_async::perform_local_partitioning),
+                          this,
+                          std::ref(working_config),
+                          std::ref(G_cpu),
+                                                  tmp_island_cpu
+                      );
+                      
+                       //std::thread t2(idle_wait);
+                       
+                     t1.join();
+                      t2.join();
+
+                      std::cout << "cpu island:";
+
+                      tmp_island_cpu->print();
+
+                      std::cout << "gpu island:";
+                      tmp_island_gpu->print();
+                      m_island->extinction();
+
+                      for( int i = 0; i < tmp_island_gpu->size(); ++i) {
+                           Individuum ind;
+                           tmp_island_gpu->get_individuum_at_pos(ind, i);
+
+                                          Individuum merged = clone_individuum(ind, G.number_of_nodes());
+                                          m_island->insert(G, merged);
+                      }
+
+                      for( int i = 0; i < tmp_island_cpu->size(); ++i) {
+                           
+                           Individuum ind;
+                           tmp_island_cpu->get_individuum_at_pos(ind, i);
+
+                           //! here again replacement logic please:
+                           for( int i = 0; i < m_island->size(); ++i) {
+                                
+                                Individuum tmp;
+                                m_island->get_individuum_at_pos(tmp, i);
+                                
+                                if( ind.objective < tmp.objective ) {
+
+                                        Individuum merged = clone_individuum(ind, G.number_of_nodes());
+                                        m_island->replace( tmp , merged );
+                                        break;
+                                }
+                           }
+
+                      }
+
+                                  delete tmp_island_gpu;
+                      delete tmp_island_cpu;
+
+                      EdgeWeight min_objective = 0;
+                      m_island->apply_fittest(G, min_objective);
+
                 }else{
                       perform_local_partitioning( working_config, G );
                 }
@@ -246,35 +370,44 @@ EdgeWeight parallel_mh_async::collect_best_partitioning(graph_access & G, const 
 }
 
 
-EdgeWeight parallel_mh_async::perform_local_partitioning_GPU(PartitionConfig & working_config, graph_access & G, std::string graph_filename) {
+EdgeWeight parallel_mh_async::perform_local_partitioning_GPU(
+        PartitionConfig & working_config, graph_access & G, std::string graph_filename,
+        population* tmp_island
+) {
 
 
         quality_metrics qm;
         unsigned local_repetitions = working_config.local_partitioning_repetitions;
-
+        local_repetitions = 3;
+        std::cout << " i will perform " << local_repetitions << " rounds" << std::endl;
         if( working_config.mh_diversify ) {
                 diversifyer div;
                 div.diversify(working_config);
         }
+                
+        GPU_HeiPa::MemeticConfiguration config = GPU_HeiPa::MemeticConfiguration();
+        config.graph_in = graph_filename;
+        config.k = working_config.k;
+        config.imbalance = working_config.imbalance / 100.0 ;
+
+        //TODO: make the config more powerful (bigger population etc.)
+
+        GPU_HeiPa::HostGraph host_g = GPU_HeiPa::from_file(config.graph_in);
+
 
         //start a new round
         for( unsigned i = 0; i < local_repetitions; i++) {
                 Individuum newguy;
 
-                //TODO: create individual with GPU solver
 
-                GPU_HeiPa::MemeticConfiguration config = GPU_HeiPa::MemeticConfiguration();
-                config.graph_in = graph_filename;
-                config.k = working_config.k;
-                config.imbalance = working_config.imbalance / 100.0 ;
-                GPU_HeiPa::HostGraph host_g = GPU_HeiPa::from_file(config.graph_in);
                 GPU_HeiPa::HostPartition host_partition = GPU_HeiPa::memeticSolverShrinking(config).solve(host_g);
                 Kokkos::fence();
+                std::cout << "finished one GPU creation" << std::endl;
 
                 if(host_partition.extent(0) != (size_t)G.number_of_nodes()) {
                         std::cout << "wrong dimension of host partition ..." << std::endl;
                         // Fall back to a CPU-built individual if the GPU output shape is unexpected.
-                        m_island->createIndividuum(working_config, G, newguy, true);
+                        tmp_island->createIndividuum(working_config, G, newguy, true);
                 } else {
                         bool valid_partition_ids = true;
                         forall_nodes(G, node) {
@@ -288,9 +421,10 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_GPU(PartitionConfig & w
                         if(!valid_partition_ids) {
                                 // GPU solver may return sentinel IDs for failed/unassigned vertices.
                                 // Keep the MH population valid by falling back to CPU individual generation.
-                                m_island->createIndividuum(working_config, G, newguy, true);
+                                tmp_island->createIndividuum(working_config, G, newguy, true);
                         } else {
-                                
+
+                        //? where do i free this?
                         int* partition_map = new int[G.number_of_nodes()];
 
                         forall_nodes(G, node) {
@@ -315,19 +449,136 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_GPU(PartitionConfig & w
 
                 //! for now just think of inserting / replacing
                 //! later i could add more V-cycle stuff if i want to...
-                if( working_config.mh_no_mh || !m_island->is_full() ) {
-                        m_island->insert(G, newguy);
+                if( working_config.mh_no_mh || !tmp_island->is_full() ) {
+                        tmp_island->insert(G, newguy);
                 }else{
-                        //! replace someone
+                        Individuum x, y;
+                        tmp_island->get_random_individuum(x);
+                        tmp_island->get_random_individuum(y);
+                        if(x.objective > newguy.objective) {
+                                tmp_island->replace( x, newguy);
+                        }else if(y.objective > newguy.objective) {
+                                tmp_island->replace( y, newguy);
+                        }
                 }
         }
 
         
         EdgeWeight min_objective = 0;
-        m_island->apply_fittest(G, min_objective);
+        //m_island->apply_fittest(G, min_objective);
 
         return min_objective;
 }
+
+
+EdgeWeight parallel_mh_async::perform_local_partitioning(PartitionConfig & working_config, graph_access & G, population* tmp_island) {
+
+        quality_metrics qm;
+        unsigned local_repetitions = working_config.local_partitioning_repetitions;
+
+        if( working_config.mh_diversify ) {
+                diversifyer div;
+                div.diversify(working_config);
+        }
+
+        //start a new round
+        for( unsigned i = 0; i < local_repetitions; i++) {
+                if( working_config.mh_no_mh ) {
+                        Individuum first_ind;
+
+                        if( !working_config.mh_easy_construction) {
+                                tmp_island->createIndividuum(working_config, G, first_ind, true);
+                                tmp_island->insert(G, first_ind);
+
+                                //! i dont even really have to understand island!
+                                //! i only need to create Individuum-objects using my solver, then i am fine :)
+                        } else {
+                                construct_partition cp;
+                                cp.createIndividuum( working_config, G, first_ind, true); 
+
+                                tmp_island->insert(G, first_ind);
+                                std::cout <<  "created with objective " <<  first_ind.objective << std::endl;
+                        }
+                } else {
+                        if( tmp_island->is_full() && !working_config.mh_disable_combine) {
+
+                                int decision = random_functions::nextInt(0,9);
+                                Individuum output;
+
+                                if(decision < working_config.mh_flip_coin) {
+                                        tmp_island->mutate_random(working_config, G, output);
+                                        tmp_island->insert(G, output);
+                                } else {
+
+                                        int combine_decision = random_functions::nextInt(0,5);
+                                        if(combine_decision <= 4) {
+                                                Individuum first_rnd;
+                                                Individuum second_rnd;
+                                                if(working_config.mh_enable_tournament_selection) {
+                                                        tmp_island->get_two_individuals_tournament(first_rnd, second_rnd);
+                                                } else {
+                                                        tmp_island->get_two_random_individuals(first_rnd, second_rnd);
+                                                }
+
+                                                tmp_island->combine(working_config, G, first_rnd, second_rnd, output);
+
+                                                int coin = 0;
+
+                                                if( working_config.mh_enable_gal_combine ) {
+                                                        coin = random_functions::nextInt(0,100);
+                                                }
+                                                if( coin == 23 ) {
+                                                        if( first_rnd.objective > second_rnd.objective) {
+                                                                tmp_island->replace(first_rnd, output);
+                                                        } else {
+                                                                tmp_island->replace(second_rnd, output);
+                                                        }
+                                                } else {
+                                                        tmp_island->insert(G, output);
+                                                }
+                                        } else if( combine_decision == 5 ) {
+                                                if(!working_config.mh_disable_cross_combine) {
+                                                        Individuum selected;
+                                                        tmp_island->get_one_individual_tournament(selected);
+                                                        tmp_island->combine_cross(working_config, G, selected, output);
+                                                        tmp_island->insert(G, output);
+                                                }
+                                        }
+                                }
+
+                        } else {
+                                Individuum first_ind;
+                                if(tmp_island->is_full()) {
+                                        tmp_island->mutate_random(working_config, G, first_ind);
+                                } else {
+                                        if( !working_config.mh_easy_construction) {
+                                                tmp_island->createIndividuum(working_config, G, first_ind, true);
+                                        } else {
+                                                construct_partition cp;
+                                                cp.createIndividuum( working_config, G, first_ind, true); 
+                                                std::cout <<  "created with objective " <<  first_ind.objective << std::endl;
+                                        }
+                                }
+                                tmp_island->insert(G, first_ind);
+                        }
+                        std::cout << "finished one CPU creation" << std::endl;
+                }
+
+                //try to combine to random inidividuals from pool 
+                if( m_t.elapsed() > m_time_limit ) {
+                        break;
+                }
+
+        }
+
+        EdgeWeight min_objective = 0;
+        //m_island->apply_fittest(G, min_objective);
+
+        return min_objective;
+}
+
+
+
 
 
 EdgeWeight parallel_mh_async::perform_local_partitioning(PartitionConfig & working_config, graph_access & G) {

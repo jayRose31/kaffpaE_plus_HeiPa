@@ -23,7 +23,8 @@ public:
         void perform_partitioning(const PartitionConfig & graph_partitioner_config, graph_access & G, std::string graph_filename);
         void initialize(PartitionConfig & graph_partitioner_config, graph_access & G);
         EdgeWeight perform_local_partitioning(PartitionConfig & graph_partitioner_config, graph_access & G);
-        EdgeWeight perform_local_partitioning_GPU(PartitionConfig & graph_partitioner_config, graph_access & G, std::string graph_filename);
+        EdgeWeight perform_local_partitioning(PartitionConfig & graph_partitioner_config, graph_access & G, population* tmp_island);
+        EdgeWeight perform_local_partitioning_GPU(PartitionConfig & graph_partitioner_config, graph_access & G, std::string graph_filename, population* tmp_island);
         EdgeWeight collect_best_partitioning(graph_access & G, const PartitionConfig & config);
         void perform_cycle_partitioning(PartitionConfig & graph_partitioner_config, graph_access & G);
 

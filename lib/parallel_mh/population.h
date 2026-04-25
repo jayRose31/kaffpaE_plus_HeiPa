@@ -66,6 +66,8 @@ class population {
 
                 void get_random_individuum(Individuum & ind);
 
+                void get_individuum_at_pos(Individuum & ind, int pos);
+
                 void get_best_individuum(Individuum & ind);
 
                 bool is_full(); 
