@@ -14,6 +14,8 @@
 #include "population.h"
 #include "timer.h"
 
+#include "extern/gpu_heipa/src/datastructures/host_graph.h"
+
 class parallel_mh_async {
 public:
         parallel_mh_async();
@@ -24,7 +26,7 @@ public:
         void initialize(PartitionConfig & graph_partitioner_config, graph_access & G);
         EdgeWeight perform_local_partitioning(PartitionConfig & graph_partitioner_config, graph_access & G);
         EdgeWeight perform_local_partitioning(PartitionConfig & graph_partitioner_config, graph_access & G, population* tmp_island);
-        EdgeWeight perform_local_partitioning_GPU(PartitionConfig & graph_partitioner_config, graph_access & G, std::string graph_filename, population* tmp_island);
+        EdgeWeight perform_local_partitioning_GPU(PartitionConfig & graph_partitioner_config, GPU_HeiPa::HostGraph & host_g , graph_access & G, std::string graph_filename, population* tmp_island);
         EdgeWeight collect_best_partitioning(graph_access & G, const PartitionConfig & config);
         void perform_cycle_partitioning(PartitionConfig & graph_partitioner_config, graph_access & G);
 
@@ -37,6 +39,8 @@ private:
         double   m_time_limit;
         bool     m_termination;
         unsigned m_rounds;
+
+        int ready_flag = 0;
 
         //the best cut found so far
         PartitionID* m_best_global_map;
