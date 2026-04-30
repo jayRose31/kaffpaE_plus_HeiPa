@@ -24,6 +24,10 @@ public:
 
         void perform_partitioning(const PartitionConfig & graph_partitioner_config, graph_access & G, std::string graph_filename);
         void initialize(PartitionConfig & graph_partitioner_config, graph_access & G);
+        
+        EdgeWeight perform_local_partitioning_gpu_producer_cpu_consumer(PartitionConfig & graph_partitioner_config, graph_access & G, GPU_HeiPa::HostGraph & host_g,PartitionConfig partition_config,  std::string graph_filename );
+        EdgeWeight perform_local_partitioning_gpu_cpu_copy_and_merge(PartitionConfig & graph_partitioner_config, graph_access & G, GPU_HeiPa::HostGraph & host_g, PartitionConfig partition_config,  std::string graph_filename );
+        
         EdgeWeight perform_local_partitioning(PartitionConfig & graph_partitioner_config, graph_access & G);
         EdgeWeight perform_local_partitioning(PartitionConfig & graph_partitioner_config, graph_access & G, population* tmp_island);
         EdgeWeight perform_local_partitioning_GPU(PartitionConfig & graph_partitioner_config, GPU_HeiPa::HostGraph & host_g , graph_access & G, std::string graph_filename, population* tmp_island);
