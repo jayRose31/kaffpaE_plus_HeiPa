@@ -28,14 +28,32 @@
 #include <Kokkos_Core.hpp>
 
 namespace {
-Individuum clone_individuum(const Individuum & src, NodeID num_nodes) {
+Individuum clone_individuum(const Individuum & src, const PartitionConfig & config, graph_access & G) {
+        NodeID num_nodes = G.number_of_nodes();
         Individuum dst;
-        dst.objective = src.objective;
+        quality_metrics qm;
+        //dst.objective = src.objective;
 
         dst.partition_map = new int[num_nodes];
         std::copy(src.partition_map, src.partition_map + num_nodes, dst.partition_map);
 
+        dst.objective = qm.objective(config, G, dst.partition_map);
+
+        if( dst.objective != src.objective) {
+                std::cout << "issue with calculating the objective in copy operator " << std::endl;
+        }
+
         dst.cut_edges = new std::vector<EdgeID>(*src.cut_edges);
+
+        forall_nodes(G, node) {
+                forall_out_edges(G, e, node) {
+                        NodeID target = G.getEdgeTarget(e);
+                        if(dst.partition_map[node] != dst.partition_map[target]) {
+                                dst.cut_edges->push_back(e);
+                        }
+                } endfor
+        } endfor
+
         return dst;
 }
 } // namespace
@@ -125,7 +143,8 @@ void parallel_mh_async::perform_partitioning(const PartitionConfig & partition_c
                 // GPU thread
                 if( m_rank == (m_size - 1)) {
 
-                      perform_local_partitioning_gpu_producer_cpu_consumer( working_config, G, host_g, partition_config, graph_filename);
+                      //perform_local_partitioning_gpu_producer_cpu_consumer( working_config, G, host_g, partition_config, graph_filename);
+                      perform_local_partitioning_gpu_cpu_copy_and_merge(working_config, G, host_g, partition_config, graph_filename);
 
                 }else{
                       perform_local_partitioning( working_config, G );
@@ -335,7 +354,7 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_gpu_producer_cpu_consum
                         tmp_island_gpu->get_individuum_at_pos(gpu_guy, i);
 
                         if( !m_island->is_full() ) {
-                                Individuum new_guy = clone_individuum(gpu_guy, G.number_of_nodes());
+                                Individuum new_guy = clone_individuum(gpu_guy, graph_partitioner_config, G);
                                 m_island->insert(G, new_guy );
                                 continue;
                         }else{
@@ -369,7 +388,7 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_gpu_producer_cpu_consum
                         
                                 if( worse_exists) {
                                         
-                                        Individuum merged = clone_individuum(gpu_guy, G.number_of_nodes());
+                                        Individuum merged = clone_individuum(gpu_guy, graph_partitioner_config, G);
                                         m_island->replace( worst , merged );
                                         
                                 }
@@ -404,23 +423,31 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_gpu_cpu_copy_and_merge(
                       
                         ready_flag = 0;
                         
-                        //population* tmp_island_cpu = new population(m_communicator, partition_config);
+                        population* tmp_island_cpu = new population(m_communicator, partition_config);
                         population* tmp_island_gpu = new population(m_communicator, partition_config);
+
+                        tmp_island_cpu->set_pool_size( graph_partitioner_config.mh_pool_size );
+                        tmp_island_gpu->set_pool_size( graph_partitioner_config.mh_pool_size );
+
                         graph_access G_gpu;
+                        graph_access G_cpu;
                         G.copy(G_gpu);
                         G_gpu.set_partition_count(G.get_partition_count());
 
-                        //for( int i = 0; i < m_island->size(); ++i) {
-                        //        Individuum ind;
-                        //        m_island->get_individuum_at_pos(ind, i);
-                        //
-                        //        Individuum cpu_clone = clone_individuum(ind, G.number_of_nodes());
-                        //        Individuum gpu_clone = clone_individuum(ind, G.number_of_nodes());
-                        //
-                        //        tmp_island_cpu->insert(G_cpu, cpu_clone);
-                        //        tmp_island_gpu->insert(G_gpu, gpu_clone);
-                        //}
+                        G.copy(G_cpu);
+                        G_cpu.set_partition_count(G.get_partition_count());
 
+                        for( int i = 0; i < m_island->size(); ++i) {
+                                Individuum ind;
+                                m_island->get_individuum_at_pos(ind, i);
+                        
+                                Individuum cpu_clone = clone_individuum(ind, partition_config, G);
+                                Individuum gpu_clone = clone_individuum(ind, partition_config, G);
+                        
+                                tmp_island_cpu->insert(G_cpu, cpu_clone);
+                                tmp_island_gpu->insert(G_gpu, gpu_clone);
+                        }
+                        m_island->extinction();
                       
                       std::thread t1(
                           &parallel_mh_async::perform_local_partitioning_GPU,
@@ -433,14 +460,14 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_gpu_cpu_copy_and_merge(
                       );  
                       
                       std::thread t2(
-                          static_cast<EdgeWeight (parallel_mh_async::*)(PartitionConfig &, graph_access &)>(&parallel_mh_async::perform_local_partitioning),
+                          static_cast<EdgeWeight (parallel_mh_async::*)(PartitionConfig &, graph_access &, population * tmp_island)>(&parallel_mh_async::perform_local_partitioning),
                           this,
                           std::ref(graph_partitioner_config),
-                          std::ref(G)//,
-                                                  //tmp_island_cpu
+                          std::ref(G),
+                        tmp_island_cpu
                       );
                       
-                       //std::thread t2(idle_wait);
+                       
                        
                      t2.join();
                       ready_flag = 1;
@@ -448,52 +475,24 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_gpu_cpu_copy_and_merge(
                      t1.join();
                       ready_flag = 0;
 
-                      // std::cout << "cpu island:";
-                      // tmp_island_cpu->print();
-                      // std::cout << "gpu island:";
-                      // tmp_island_gpu->print();
-                      // m_island->extinction();
-                      /*
+                      std::cout << "cpu island:";
+                      tmp_island_cpu->print();
+                      std::cout << "gpu island:";
+                      tmp_island_gpu->print();
+                      // 
+                      /**/
                       
-                      for( int i = 0; i < tmp_island_gpu->size(); ++i) {
-                           Individuum ind;
-                           tmp_island_gpu->get_individuum_at_pos(ind, i);
-
-                                          Individuum merged = clone_individuum(ind, G.number_of_nodes());
-                                          m_island->insert(G, merged);
-                      }
-
                       for( int i = 0; i < tmp_island_cpu->size(); ++i) {
-                           
                            Individuum ind;
                            tmp_island_cpu->get_individuum_at_pos(ind, i);
 
-                           //! here again replacement logic please:
-                           for( int i = 0; i < m_island->size(); ++i) {
-                                
-                                Individuum tmp;
-                                m_island->get_individuum_at_pos(tmp, i);
-                                
-                                if( ind.objective < tmp.objective ) {
-
-                                        Individuum merged = clone_individuum(ind, G.number_of_nodes());
-                                        m_island->replace( tmp , merged );
-                                        break;
-                                }
-                           }
-
+                           Individuum merged = clone_individuum(ind, partition_config, G);
+                           m_island->insert(G, merged);
                       }
 
                       delete tmp_island_cpu;
-                      */
-                      //merge die gpu individuals into die main population
 
-                      std::cout << "pop before merging: " << std::endl;
-                      std::cout << " main pop: ";
-                      m_island->print();
-                      std::cout << " gpu pop: ";
-                      tmp_island_gpu->print();
-                      
+
 
                       for(int i= 0; i < tmp_island_gpu->size() ; ++i ) {
 
@@ -501,12 +500,13 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_gpu_cpu_copy_and_merge(
                         tmp_island_gpu->get_individuum_at_pos(gpu_guy, i);
 
                         if( !m_island->is_full() ) {
-                                Individuum new_guy = clone_individuum(gpu_guy, G.number_of_nodes());
+                                Individuum new_guy = clone_individuum(gpu_guy, partition_config, G);
                                 m_island->insert(G, new_guy );
                                 continue;
                         }else{
 
-                                
+                                bool duplicate = false;
+
                                 bool worse_exists = false;
                                 Individuum worst;
                                 
@@ -530,12 +530,18 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_gpu_cpu_copy_and_merge(
                                                 }
                                                 
                                                 
+                                        }else{
+                                                if(gpu_guy.objective == tmp.objective){
+                                                        duplicate = true;
+                                                        break;
+                                                        //! you could check further here by comparing the actual partition values...
+                                                }
                                         }
                                 }
                         
-                                if( worse_exists) {
+                                if( worse_exists && !duplicate) {
                                         
-                                        Individuum merged = clone_individuum(gpu_guy, G.number_of_nodes());
+                                        Individuum merged = clone_individuum(gpu_guy, partition_config, G);
                                         m_island->replace( worst , merged );
                                         
                                 }
@@ -544,8 +550,7 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_gpu_cpu_copy_and_merge(
 
                       }
 
-
-                     delete tmp_island_gpu;
+                      delete tmp_island_gpu;
 
                       std::cout << "pop after merging: " << std::endl;
                       std::cout << " main pop: ";
@@ -567,8 +572,6 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_GPU(
 
         quality_metrics qm;
         unsigned local_repetitions = working_config.local_partitioning_repetitions;
-        local_repetitions = 3;
-        std::cout << " i will perform " << local_repetitions << " rounds" << std::endl;
         if( working_config.mh_diversify ) {
                 diversifyer div;
                 div.diversify(working_config);
@@ -579,12 +582,21 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_GPU(
         config.k = working_config.k;
         config.imbalance = working_config.imbalance / 100.0 ; 
 
-        //TODO: make the config more powerful (bigger population etc.)
+
         config.num_individuals = 70;
         config.num_crossovers = 5;
         config.mutation_percentile = 0.2f;
 
         
+        if( working_config.strong ) {
+                
+                config.num_individuals = 200;
+                config.num_crossovers = 10;
+                config.reduction_factor = 10;
+                config.mutation_percentile = 0.4f;
+                config.mutation_rate = 0.8f;
+                
+        }
 
 
         //start a new round
