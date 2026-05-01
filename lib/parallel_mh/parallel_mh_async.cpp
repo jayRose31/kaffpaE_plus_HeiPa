@@ -24,6 +24,7 @@
 #include "random_functions.h"
 
 #include "extern/gpu_heipa/src/datastructures/memeticSolverShrinking.h"
+#include "extern/gpu_heipa/src/utility/definitions.h"
 #include "extern/gpu_heipa/src/utility/memetic_configuration.h"
 #include <Kokkos_Core.hpp>
 
@@ -602,58 +603,57 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_GPU(
         //start a new round
         //for( unsigned i = 0; i < local_repetitions; i++) 
         while( ready_flag != 1 ){
+
                 Individuum newguy;
+                GPU_HeiPa::HostPartition host_partition;
+                
+                int decision = random_functions::nextInt(0,9);
+                
+                // ! den pfad erstmal deaktivieren um V-cycle zu testen
+                if(decision < working_config.mh_flip_coin || !tmp_island->is_full() ) {
 
+                        //! simply create new individual:
 
-                GPU_HeiPa::HostPartition host_partition = GPU_HeiPa::memeticSolverShrinking(config).solve(host_g);
-                Kokkos::fence();
-                std::cout << "finished one GPU creation" << std::endl;
+                        host_partition = GPU_HeiPa::memeticSolverShrinking(config).solve(host_g);
+                        Kokkos::fence();
+                
+                } else{
 
-                if(host_partition.extent(0) != (size_t)G.number_of_nodes()) {
-                        std::cout << "wrong dimension of host partition ..." << std::endl;
-                        // Fall back to a CPU-built individual if the GPU output shape is unexpected.
-                        tmp_island->createIndividuum(working_config, G, newguy, true);
-                } else {
-                        bool valid_partition_ids = true;
-                        forall_nodes(G, node) {
-                                if(static_cast<PartitionID>(host_partition(node)) >= G.get_partition_count()) {
-                                        valid_partition_ids = false;
-                                        std::cout << "wrong id somehow..." << std::endl;
-                                        break;
+                        //! create new individual using V-cycle
+
+                        Individuum random_guy;
+                        tmp_island->get_random_individuum(random_guy);
+   
+                        host_partition = GPU_HeiPa::memeticSolverShrinking(config).solve(host_g, random_guy.partition_map);
+                        Kokkos::fence();
+                       
+                }
+
+                 std::cout << "finished one GPU creation" << std::endl;
+                
+                //? where do i free this?
+                int* partition_map = new int[G.number_of_nodes()];
+
+                forall_nodes(G, node) {
+                        partition_map[node] = static_cast<int>(host_partition(node));
+                } endfor
+
+                newguy.partition_map = partition_map;
+                newguy.objective     = qm.objective(working_config, G, partition_map);
+                newguy.cut_edges     = new std::vector<EdgeID>();
+
+                forall_nodes(G, node) {
+                        forall_out_edges(G, e, node) {
+                                NodeID target = G.getEdgeTarget(e);
+                                if(partition_map[node] != partition_map[target]) {
+                                        newguy.cut_edges->push_back(e);
                                 }
                         } endfor
-
-                        if(!valid_partition_ids) {
-                                // GPU solver may return sentinel IDs for failed/unassigned vertices.
-                                // Keep the MH population valid by falling back to CPU individual generation.
-                                tmp_island->createIndividuum(working_config, G, newguy, true);
-                        } else {
-
-                        //? where do i free this?
-                        int* partition_map = new int[G.number_of_nodes()];
-
-                        forall_nodes(G, node) {
-                                partition_map[node] = static_cast<int>(host_partition(node));
-                        } endfor
-
-                        newguy.partition_map = partition_map;
-                        newguy.objective     = qm.objective(working_config, G, partition_map);
-                        newguy.cut_edges     = new std::vector<EdgeID>();
-
-                        forall_nodes(G, node) {
-                                forall_out_edges(G, e, node) {
-                                        NodeID target = G.getEdgeTarget(e);
-                                        if(partition_map[node] != partition_map[target]) {
-                                                newguy.cut_edges->push_back(e);
-                                        }
-                                } endfor
-                        } endfor
-                        }
-                }
+                } endfor
+                        
+        
                 
 
-                //! for now just think of inserting / replacing
-                //! later i could add more V-cycle stuff if i want to...
                 if( working_config.mh_no_mh || !tmp_island->is_full() ) {
                         tmp_island->insert(G, newguy);
                 }else{
