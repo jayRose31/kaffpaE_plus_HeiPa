@@ -72,7 +72,8 @@ parallel_mh_async::parallel_mh_async() : MASTER(0), m_time_limit(0) {
         MPI_Comm_rank( m_communicator, &m_rank);
         MPI_Comm_size( m_communicator, &m_size);
 
-        if( m_rank == (m_size - 1))
+
+        if( m_rank == (0))
                 Kokkos::initialize();
 }
 
@@ -86,15 +87,17 @@ parallel_mh_async::parallel_mh_async(MPI_Comm communicator) : MASTER(0), m_time_
         MPI_Comm_rank( m_communicator, &m_rank);
         MPI_Comm_size( m_communicator, &m_size);
 
-        if( m_rank == (m_size - 1))
+
+        if( m_rank == (0))
                 Kokkos::initialize();
 
 }
 
 parallel_mh_async::~parallel_mh_async() {
-        if( m_rank == (m_size - 1))
+        if( m_rank == (0))
                 Kokkos::finalize();
         
+
         delete[] m_best_global_map;
 }
 
@@ -112,7 +115,7 @@ void parallel_mh_async::perform_partitioning(const PartitionConfig & partition_c
         m_best_global_map = new PartitionID[G.number_of_nodes()];
 
         GPU_HeiPa::HostGraph host_g ;
-        if( m_rank == (m_size - 1)) {
+        if( m_rank == (0)) {
                 host_g = GPU_HeiPa::from_file(graph_filename);
         }
 
@@ -142,9 +145,10 @@ void parallel_mh_async::perform_partitioning(const PartitionConfig & partition_c
                 std::cout << " perform local partitioning: " << std::endl;
 
                 // GPU thread
-                if( m_rank == (m_size - 1)) {
+//                if( m_rank == (0)) {
+                if( m_rank == 0) {
 
-                      //perform_local_partitioning_gpu_producer_cpu_consumer( working_config, G, host_g, partition_config, graph_filename);
+                      // perform_local_partitioning_gpu_producer_cpu_consumer( working_config, G, host_g, partition_config, graph_filename);
                       perform_local_partitioning_gpu_cpu_copy_and_merge(working_config, G, host_g, partition_config, graph_filename);
 
                 }else{
@@ -266,8 +270,8 @@ EdgeWeight parallel_mh_async::collect_best_partitioning(graph_access & G, const 
 
         //! change to L_max bound!
         NodeWeight L_max;
-        L_max = ceil( (1 + ( config.epsilon / 100.0f )) * ( total_weight / config.k ) );
-
+        L_max = ceil( (1.0f + ( config.imbalance / 100.0f )) * ( static_cast<float>(total_weight) / static_cast<float>(config.k) ) );
+        
         if( max_domain_weight > L_max ) {
                 best_local_objective_m = std::numeric_limits< int >::max();
         }
@@ -311,7 +315,7 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_gpu_producer_cpu_consum
 ) {
 
 
-                        ready_flag = 0;
+                        ready_flag.store(false, std::memory_order_release);
                         
                         population* tmp_island_gpu = new population(m_communicator, partition_config);
                         graph_access G_gpu;
@@ -336,10 +340,10 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_gpu_producer_cpu_consum
                       );
 
                      t2.join();
-                      ready_flag = 1;
+                      ready_flag.store(true, std::memory_order_release);
 
                      t1.join();
-                      ready_flag = 0;
+                      ready_flag.store(false, std::memory_order_release);
 
 
                       std::cout << "pop before merging: " << std::endl;
@@ -422,7 +426,7 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_gpu_cpu_copy_and_merge(
 
 
                       
-                        ready_flag = 0;
+                        ready_flag.store(false, std::memory_order_release);
                         
                         population* tmp_island_cpu = new population(m_communicator, partition_config);
                         population* tmp_island_gpu = new population(m_communicator, partition_config);
@@ -458,7 +462,7 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_gpu_cpu_copy_and_merge(
                           std::ref(G_gpu),
                           graph_filename,
                           tmp_island_gpu
-                      );  
+                      );
                       
                       std::thread t2(
                           static_cast<EdgeWeight (parallel_mh_async::*)(PartitionConfig &, graph_access &, population * tmp_island)>(&parallel_mh_async::perform_local_partitioning),
@@ -471,10 +475,12 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_gpu_cpu_copy_and_merge(
                        
                        
                      t2.join();
-                      ready_flag = 1;
+                     
+                      ready_flag.store(true, std::memory_order_release);
 
                      t1.join();
-                      ready_flag = 0;
+                     
+                      ready_flag.store(false, std::memory_order_release);
 
                       std::cout << "cpu island:";
                       tmp_island_cpu->print();
@@ -483,12 +489,29 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_gpu_cpu_copy_and_merge(
                       // 
                       /**/
                       
+
+                      //! hier können immernoch duplikate reinkommen!
                       for( int i = 0; i < tmp_island_cpu->size(); ++i) {
                            Individuum ind;
                            tmp_island_cpu->get_individuum_at_pos(ind, i);
 
-                           Individuum merged = clone_individuum(ind, partition_config, G);
-                           m_island->insert(G, merged);
+                           bool duplicate = false;
+                           for(int j = 0; j < m_island->size(); ++j) {
+                                Individuum tmp;
+                                m_island->get_individuum_at_pos(tmp, j);
+                                if( tmp.objective == ind.objective) {
+                                        duplicate = true;
+                                        break;
+                                }
+                           }
+
+
+                           if(!duplicate) {
+
+                                   Individuum merged = clone_individuum(ind, partition_config, G);
+                                   m_island->insert(G, merged);
+                            
+                            }
                       }
 
                       delete tmp_island_cpu;
@@ -589,38 +612,42 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_GPU(
         config.mutation_percentile = 0.2f;
 
         
-        if( working_config.strong ) {
-                
-                config.num_individuals = 200;
-                config.num_crossovers = 10;
-                config.reduction_factor = 10;
-                config.mutation_percentile = 0.4f;
-                config.mutation_rate = 0.8f;
-                
-        }
+         if( working_config.strong ) {
+                 
+                 config.num_individuals = 200;
+                 config.num_crossovers = 10;
+                 config.reduction_factor = 10;
+                 config.mutation_percentile = 0.4f;
+                 config.mutation_rate = 0.8f;
+                 
+         }
 
 
         //start a new round
         //for( unsigned i = 0; i < local_repetitions; i++) 
-        while( ready_flag != 1 ){
+        unsigned int curr_iteration = 0;
+        while( !ready_flag.load(std::memory_order_acquire)  && curr_iteration < 20 ){
+                
+                curr_iteration += 1;
 
+                
                 Individuum newguy;
                 GPU_HeiPa::HostPartition host_partition;
                 
                 int decision = random_functions::nextInt(0,9);
                 
                 // ! den pfad erstmal deaktivieren um V-cycle zu testen
-                if(decision < working_config.mh_flip_coin || !tmp_island->is_full() ) {
+                if(decision < 4 || !tmp_island->is_full() ) {
 
                         //! simply create new individual:
-
+                        
                         host_partition = GPU_HeiPa::memeticSolverShrinking(config).solve(host_g);
                         Kokkos::fence();
                 
                 } else{
 
                         //! create new individual using V-cycle
-
+                        
                         Individuum random_guy;
                         tmp_island->get_random_individuum(random_guy);
    
@@ -629,7 +656,7 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_GPU(
                        
                 }
 
-                 std::cout << "finished one GPU creation" << std::endl;
+                 
                 
                 //? where do i free this?
                 int* partition_map = new int[G.number_of_nodes()];
@@ -657,14 +684,36 @@ EdgeWeight parallel_mh_async::perform_local_partitioning_GPU(
                 if( working_config.mh_no_mh || !tmp_island->is_full() ) {
                         tmp_island->insert(G, newguy);
                 }else{
-                        Individuum x, y;
-                        tmp_island->get_random_individuum(x);
-                        tmp_island->get_random_individuum(y);
-                        if(x.objective > newguy.objective) {
-                                tmp_island->replace( x, newguy);
-                        }else if(y.objective > newguy.objective) {
-                                tmp_island->replace( y, newguy);
+
+                        bool found = false;
+                        Individuum worst;
+                        for( int i = 0; i < tmp_island->size(); ++i) {
+
+                                Individuum tmp;
+                                tmp_island->get_individuum_at_pos(tmp, i);
+
+                                //! prevent duplicates from entering the population:
+                                if( tmp.objective == newguy.objective) {
+                                        found = false;
+                                        break;
+                                }
+                                
+                                if( tmp.objective > newguy.objective) {
+                                        if(!found) {
+                                                found = true;
+                                                worst = tmp;
+                                        }else{
+                                                if( worst.objective < tmp.objective ) {
+                                                        worst = tmp;
+                                                }
+                                        }
+                                }
+
                         }
+                        if(found) {
+                                tmp_island->replace(worst, newguy);
+                        }
+
                 }
         }
 

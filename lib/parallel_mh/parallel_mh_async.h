@@ -9,6 +9,7 @@
 #define PARALLEL_MH_ASYNC_HF106Y0G
 
 #include <mpi.h>
+#include <atomic>
 #include "data_structure/graph_access.h"
 #include "partition_config.h"
 #include "population.h"
@@ -44,7 +45,9 @@ private:
         bool     m_termination;
         unsigned m_rounds;
 
-        int ready_flag = 0;
+        std::atomic<bool> ready_flag{false};
+        
+
 
         //the best cut found so far
         PartitionID* m_best_global_map;
